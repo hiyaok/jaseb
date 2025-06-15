@@ -1,36 +1,40 @@
+#
 #!/usr/bin/env python3
 """
-TELEGRAM USERBOT JASEBKING - COMPLETE SOURCE CODE
-Version: 2.0 FULL FEATURED
-Support: All media types, emoji premium, text formatting
-Author: Jasebking
-Creator : By @hiyaok
-
-CARA PAKAI:
-1. Ganti API_ID dan API_HASH di bawah
-2. Install: pip install telethon
-3. Run: python hiyaok.py
+TELEGRAM MULTI USERBOT MANAGER - JASEBSIX
+Version: 3.0 ULTIMATE BY HIYAOK
+Features: Multi userbot, schedule, auto expire, full control
+Author: Jasebsix
+Creator : @hiyaok
 """
 
 import asyncio
 import os
 import json
 import re
-from datetime import datetime, time
+import sys
+from datetime import datetime, timedelta
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, UserNotParticipantError
-from telethon.tl.types import MessageEntityCustomEmoji
-from telethon.tl.custom import Message
+from telethon.errors import FloodWaitError, UserNotParticipantError, SessionPasswordNeededError
 import logging
+from typing import Dict, List, Optional
+import shutil
+from pathlib import Path
 
 # ==================== CONFIGURATION ====================
-# GANTI DENGAN API CREDENTIALS ANDA DARI https://my.telegram.org
-API_ID = 20706311  # GANTI DENGAN API ID ANDA (ANGKA)
+# GANTI DENGAN API CREDENTIALS ANDA
+API_ID = 20706311  # GANTI DENGAN API ID ANDA
 API_HASH = '3bde90bb1545d10b9d2f302586ca5e6f'  # GANTI DENGAN API HASH ANDA
 
-# File untuk menyimpan data
-DATA_FILE = 'userbot_data.json'
+# Directories
+BASE_DIR = Path("userbot_data")
+SESSIONS_DIR = BASE_DIR / "sessions"
+DATA_DIR = BASE_DIR / "data"
+BACKUP_DIR = BASE_DIR / "backups"
+
+# Files
+MANAGER_DATA = BASE_DIR / "manager.json"
 
 # Setup logging
 logging.basicConfig(
@@ -39,17 +43,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== MAIN USERBOT CLASS ====================
+# ==================== USERBOT CLASS ====================
 class UserBot:
-    def __init__(self):
+    def __init__(self, phone: str, session_name: str, expire_date: datetime):
+        self.phone = phone
+        self.session_name = session_name
+        self.expire_date = expire_date
         self.client = None
+        self.data_file = DATA_DIR / f"{session_name}_data.json"
         self.data = self.load_data()
         self.running = False
         self.timer_task = None
+        self.schedule_task = None
+        self.is_active = True
         
     def load_data(self):
         """Load saved data from JSON file"""
         default_data = {
+            'phone': self.phone,
+            'session_name': self.session_name,
+            'expire_date': self.expire_date.isoformat(),
+            'created_date': datetime.now().isoformat(),
             'admins': [],
             'groups': [],
             'selected_groups': [],
@@ -60,14 +74,24 @@ class UserBot:
             'sleep_time': {'start': '22:00', 'end': '06:00'},
             'notif_user': None,
             'spam_timer': 5,
-            'group_timer': 1,
+            'group_timer': 1,  # Default 1 detik delay antar grup
             'run_timer': None,
-            'bot_active': True
+            'bot_active': True,
+            'schedule': {
+                'enabled': False,
+                'start_date': None,
+                'end_date': None
+            },
+            'stats': {
+                'total_sent': 0,
+                'total_failed': 0,
+                'last_run': None
+            }
         }
         
         try:
-            if os.path.exists(DATA_FILE):
-                with open(DATA_FILE, 'r') as f:
+            if self.data_file.exists():
+                with open(self.data_file, 'r') as f:
                     loaded_data = json.load(f)
                     for key, value in default_data.items():
                         if key not in loaded_data:
@@ -78,86 +102,138 @@ class UserBot:
             return default_data
     
     def save_data(self):
-        """Save data to JSON file"""
-        with open(DATA_FILE, 'w') as f:
-            json.dump(self.data, f, indent=2)
+        """Save data to JSON file with backup"""
+        try:
+            # Create backup first
+            if self.data_file.exists():
+                backup_file = BACKUP_DIR / f"{self.session_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                shutil.copy(self.data_file, backup_file)
+                
+                # Keep only last 5 backups
+                backups = sorted(BACKUP_DIR.glob(f"{self.session_name}_*.json"))
+                if len(backups) > 5:
+                    for old_backup in backups[:-5]:
+                        old_backup.unlink()
+            
+            # Save data
+            with open(self.data_file, 'w') as f:
+                json.dump(self.data, f, indent=2)
+                
+        except Exception as e:
+            logger.error(f"Error saving data: {e}")
     
     async def start(self):
         """Start the userbot"""
-        print("🤖 TELEGRAM USERBOT JASEBKING 🤖")
-        print("=" * 50)
-        print("📌 Version: 2.0 FULL FEATURED")
-        print("📸 Support: All media, emoji premium, formatting")
-        print("=" * 50)
-        
-        # Check session
-        if not os.path.exists('userbot.session'):
-            phone = input("\n📱 Masukkan nomor telepon (dengan kode negara, contoh: +628xxx): ")
-            self.client = TelegramClient('userbot', API_ID, API_HASH)
-        else:
-            self.client = TelegramClient('userbot', API_ID, API_HASH)
-        
         try:
-            await self.client.start()
+            session_file = SESSIONS_DIR / f"{self.session_name}.session"
+            self.client = TelegramClient(str(session_file), API_ID, API_HASH)
+            
+            await self.client.connect()
+            
+            if not await self.client.is_user_authorized():
+                logger.error(f"Session {self.session_name} not authorized!")
+                return False
+            
+            # Get self info
+            me = await self.client.get_me()
+            if not self.data['admins']:
+                self.data['admins'] = [me.id]
+                self.save_data()
+            
+            # Register handlers
+            self.register_handlers()
+            
+            # Start schedule checker
+            self.schedule_task = asyncio.create_task(self.check_schedule())
+            
+            # Send startup notification
+            await self.send_admin_notif(
+                "🚀 **USERBOT STARTED**\n\n"
+                f"👤 **User:** {me.first_name}\n"
+                f"🆔 **ID:** `{me.id}`\n"
+                f"📱 **Username:** @{me.username}\n"
+                f"📱 **Phone:** {self.phone}\n"
+                f"⏰ **Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📅 **Expire:** {self.expire_date.strftime('%Y-%m-%d')}\n\n"
+                "Ketik `.fitur` untuk melihat semua fitur."
+            )
+            
+            self.is_active = True
+            return True
+            
         except Exception as e:
-            print(f"\n❌ Error: {e}")
-            print("\n💡 Solusi:")
-            print("1. Cek API_ID dan API_HASH sudah benar")
-            print("2. Cek koneksi internet")
-            print("3. Hapus file userbot.session dan coba lagi")
-            return
-        
-        # Get self info
-        me = await self.client.get_me()
-        if not self.data['admins']:
-            self.data['admins'] = [me.id]
-            self.save_data()
-        
-        print(f"\n✅ Berhasil login sebagai: {me.first_name} (@{me.username})")
-        print("=" * 50)
-        
-        # Register handlers
-        self.register_handlers()
-        
-        # Send startup notification
-        await self.send_admin_notif(
-            "🚀 **USERBOT STARTED**\n\n"
-            f"👤 **User:** {me.first_name}\n"
-            f"🆔 **ID:** `{me.id}`\n"
-            f"📱 **Username:** @{me.username}\n"
-            f"⏰ **Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            "Ketik `.fitur` untuk melihat semua fitur."
-        )
-        
-        print("\n📌 Bot berhasil dijalankan!")
-        print("📌 Ketik .fitur di Telegram untuk melihat semua perintah")
-        print("📌 Ketik .jasebking untuk tutorial")
-        
-        await self.client.run_until_disconnected()
+            logger.error(f"Error starting userbot: {e}")
+            return False
+    
+    async def stop(self):
+        """Stop the userbot and logout"""
+        try:
+            if self.timer_task:
+                self.timer_task.cancel()
+            if self.schedule_task:
+                self.schedule_task.cancel()
+            
+            self.running = False
+            self.is_active = False
+            
+            if self.client and self.client.is_connected():
+                # Leave all groups first
+                async for dialog in self.client.iter_dialogs():
+                    if dialog.is_group or dialog.is_channel:
+                        try:
+                            await self.client.delete_dialog(dialog)
+                        except:
+                            pass
+                
+                # Send goodbye message
+                await self.send_admin_notif(
+                    "👋 **USERBOT STOPPED**\n\n"
+                    f"Session {self.session_name} has been terminated.\n"
+                    f"All groups have been left."
+                )
+                
+                # Logout and disconnect
+                await self.client.log_out()
+                await self.client.disconnect()
+            
+            # Remove session file
+            session_file = SESSIONS_DIR / f"{self.session_name}.session"
+            if session_file.exists():
+                session_file.unlink()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error stopping userbot: {e}")
+            return False
     
     def register_handlers(self):
         """Register all event handlers"""
         
-        @self.client.on(events.NewMessage(pattern=r'^\.jasebking$'))
+        @self.client.on(events.NewMessage(pattern=r'^\.jasebsix$'))
         async def tutorial_handler(event):
             if not await self.is_admin(event.sender_id):
                 return
             
-            tutorial = """
-🔑 **TUTORIAL USERBOT JASEBKING**
+            tutorial = f"""
+🔑 **TUTORIAL USERBOT JASEBSIX**
 
-📋 **Cara Menggunakan:**
-1. Cek grup yang ada: `.cekgrub`
-2. Pilih grup: `.setgrub 2 5 8` atau `.setgrub all`
-3. Reply pesan yang mau dikirim
-4. Set pesan: `.pesan nofw` atau `.pesan fw`
-5. Mulai kirim: `.run 5` (tiap 5 menit)
-6. Stop: `.run off`
+📱 **Session Info:**
+• Phone: {self.phone}
+• Expire: {self.expire_date.strftime('%Y-%m-%d')}
+• Days left: {(self.expire_date - datetime.now()).days}
 
-✨ **Support:**
-• Semua jenis media (foto, video, dokumen, dll)
-• Emoji premium & text formatting
-• Caption dengan format bold, italic, dll
+📋 **Quick Start:**
+1. `.cekgrub` - Cek semua grup
+2. `.setgrub all` - Pilih semua grup
+3. Reply pesan → `.pesan nofw`
+4. `.jadwal set` - Set jadwal (opsional)
+5. `.run 5` - Mulai kirim tiap 5 menit
+
+✨ **New Features:**
+• Schedule otomatis
+• Auto expire
+• Multi userbot support
 
 📚 Ketik `.fitur` untuk lihat semua perintah
 """
@@ -190,6 +266,7 @@ class UserBot:
             self.save_data()
             
             message += f"\n📊 Total: {len(self.data['groups'])} grup"
+            message += f"\n✅ Selected: {len(self.data.get('selected_groups', []))} grup"
             await event.reply(message)
         
         @self.client.on(events.NewMessage(pattern=r'^\.setgrub\s+(.+)$'))
@@ -219,6 +296,15 @@ class UserBot:
                     await event.reply("❌ Format salah! Gunakan: `.setgrub 1 2 3` atau `.setgrub all`")
             
             self.save_data()
+        
+        @self.client.on(events.NewMessage(pattern=r'^\.resetgrup$'))
+        async def reset_groups_handler(event):
+            if not await self.is_admin(event.sender_id):
+                return
+            
+            self.data['selected_groups'] = []
+            self.save_data()
+            await event.reply("🔄 Semua grup target telah direset!")
         
         @self.client.on(events.NewMessage(pattern=r'^\.pesan\s+(fw|nofw)$'))
         async def set_message_handler(event):
@@ -257,19 +343,81 @@ class UserBot:
                 'message_id': replied.id,
                 'chat_id': replied.chat_id,
                 'media_type': media_type,
-                'has_media': bool(replied.media)
+                'has_media': bool(replied.media),
+                'saved_time': datetime.now().isoformat()
             }
             self.save_data()
             
-            response = f"✅ Pesan berhasil disimpan!\n"
+            response = f"✅ **Pesan berhasil disimpan!**\n\n"
             response += f"📋 Mode: {'Forward' if forward else 'No Forward'}\n"
             if media_type:
                 response += f"📎 Media: {media_type}\n"
             if replied.text:
-                response += f"💬 Caption: Yes\n"
-            response += f"✨ Emoji & formatting: **Preserved!**"
+                response += f"💬 Caption: {len(replied.text)} chars\n"
+            response += f"⏰ Saved: {datetime.now().strftime('%H:%M:%S')}\n"
+            response += f"✨ Formatting: **Preserved!**"
             
             await event.reply(response)
+        
+        @self.client.on(events.NewMessage(pattern=r'^\.jadwal\s+(.+)$'))
+        async def schedule_handler(event):
+            if not await self.is_admin(event.sender_id):
+                return
+            
+            args = event.pattern_match.group(1).strip()
+            
+            if args == 'set':
+                await event.reply(
+                    "📅 **SET JADWAL**\n\n"
+                    "Format: `.jadwal YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM`\n"
+                    "Contoh: `.jadwal 2024-01-15 09:00 to 2024-01-15 17:00`\n\n"
+                    "Atau gunakan:\n"
+                    "`.jadwal now to 2024-01-15 17:00` - Mulai sekarang"
+                )
+            elif args == 'off':
+                self.data['schedule']['enabled'] = False
+                self.save_data()
+                await event.reply("📅 Jadwal dinonaktifkan!")
+            elif args == 'info':
+                sched = self.data['schedule']
+                if sched['enabled']:
+                    await event.reply(
+                        f"📅 **JADWAL AKTIF**\n\n"
+                        f"🟢 Start: {sched['start_date']}\n"
+                        f"🔴 End: {sched['end_date']}\n"
+                        f"⏰ Current: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                    )
+                else:
+                    await event.reply("📅 Jadwal tidak aktif")
+            else:
+                # Parse schedule
+                try:
+                    parts = args.split(' to ')
+                    if len(parts) == 2:
+                        start_str, end_str = parts
+                        
+                        if start_str.lower() == 'now':
+                            start_date = datetime.now()
+                        else:
+                            start_date = datetime.strptime(start_str, '%Y-%m-%d %H:%M')
+                        
+                        end_date = datetime.strptime(end_str, '%Y-%m-%d %H:%M')
+                        
+                        self.data['schedule'] = {
+                            'enabled': True,
+                            'start_date': start_date.isoformat(),
+                            'end_date': end_date.isoformat()
+                        }
+                        self.save_data()
+                        
+                        await event.reply(
+                            f"📅 **JADWAL DIATUR**\n\n"
+                            f"🟢 Mulai: {start_date.strftime('%Y-%m-%d %H:%M')}\n"
+                            f"🔴 Berakhir: {end_date.strftime('%Y-%m-%d %H:%M')}\n"
+                            f"⏱ Durasi: {end_date - start_date}"
+                        )
+                except:
+                    await event.reply("❌ Format salah! Gunakan: `.jadwal info` untuk bantuan")
         
         @self.client.on(events.NewMessage(pattern=r'^\.on$'))
         async def activate_bot_handler(event):
@@ -290,7 +438,7 @@ class UserBot:
             if self.timer_task:
                 self.timer_task.cancel()
             self.save_data()
-            await event.reply("❌ Bot dinonaktifkan!")
+            await event.reply("❌ Bot dinonaktifkan! (Session tetap aktif)")
         
         @self.client.on(events.NewMessage(pattern=r'^\.pm\s+(.+)$'))
         async def pm_handler(event):
@@ -356,7 +504,12 @@ class UserBot:
                     self.data['run_timer'] = minutes
                     self.running = True
                     
-                    await event.reply(f"▶️ Mulai mengirim pesan setiap {minutes} menit...")
+                    await event.reply(
+                        f"▶️ **TIMER STARTED**\n\n"
+                        f"⏱ Interval: {minutes} menit\n"
+                        f"📊 Target: {len(self.data.get('selected_groups', []))} grup\n"
+                        f"⏸ Stop: `.run off`"
+                    )
                     
                     if self.timer_task:
                         self.timer_task.cancel()
@@ -485,29 +638,35 @@ class UserBot:
                 return
             
             features = """
-📚 **DAFTAR FITUR USERBOT**
+📚 **DAFTAR FITUR USERBOT V3.0**
 
 **📌 Tutorial & Info:**
 • `.jasebking` - Tutorial penggunaan
 • `.fitur` - Daftar semua fitur
-• `.status` - Status userbot
-• `.testformat` - Test emoji & formatting
+• `.status` - Status lengkap userbot
 
 **📁 Manajemen Grup:**
 • `.cekgrub` - Cek semua grup
 • `.setgrub 2 5 8` - Pilih grup tertentu
 • `.setgrub all` - Pilih semua grup
+• `.resetgrup` - Reset semua pilihan grup
 • `.join @grup1 @grup2` - Join grup (max 5)
 • `.out` - Keluar dari semua grup
 
 **💬 Pengaturan Pesan:**
 • `.pesan fw` - Set pesan forward (reply)
 • `.pesan nofw` - Set pesan no forward (reply)
-📸 Support: All media types + caption
+
+**📅 Jadwal (NEW!):**
+• `.jadwal set` - Lihat cara set jadwal
+• `.jadwal YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM` - Set jadwal
+• `.jadwal now to YYYY-MM-DD HH:MM` - Mulai sekarang
+• `.jadwal info` - Lihat jadwal aktif
+• `.jadwal off` - Matikan jadwal
 
 **🤖 Kontrol Bot:**
-• `.on` - Aktifkan bot
-• `.off` - Nonaktifkan bot
+• `.on` - Aktifkan bot (fitur only)
+• `.off` - Nonaktifkan bot (session tetap)
 • `.run 5` - Kirim tiap 5 menit
 • `.run off` - Matikan timer
 
@@ -523,7 +682,7 @@ class UserBot:
 
 **⏱ Timer:**
 • `.timer spam 5` - Delay antar spam (detik)
-• `.timer grub 2` - Delay antar grup (detik)
+• `.timer grub 1` - Delay antar grup (detik)
 
 **📬 Notifikasi:**
 • `.notif @username` - Kirim notif ke user
@@ -548,36 +707,72 @@ class UserBot:
             
             me = await self.client.get_me()
             
+            # Calculate session info
+            days_left = (self.expire_date - datetime.now()).days
+            created_date = datetime.fromisoformat(self.data.get('created_date', datetime.now().isoformat()))
+            days_active = (datetime.now() - created_date).days
+            
+            # Get saved message info
             msg_info = "Tidak ada"
             if self.data.get('message', {}).get('message_id'):
-                msg_type = self.data['message'].get('media_type', 'Text')
-                msg_mode = 'Forward' if self.data['message'].get('forward') else 'No Forward'
-                msg_info = f"{msg_type} ({msg_mode})"
+                msg = self.data['message']
+                msg_type = msg.get('media_type', 'Text')
+                msg_mode = 'Forward' if msg.get('forward') else 'No Forward'
+                saved_time = datetime.fromisoformat(msg.get('saved_time', datetime.now().isoformat()))
+                time_ago = datetime.now() - saved_time
+                hours_ago = int(time_ago.total_seconds() / 3600)
+                msg_info = f"{msg_type} ({msg_mode}) - {hours_ago}h ago"
+            
+            # Schedule info
+            sched_info = "Tidak aktif"
+            if self.data['schedule']['enabled']:
+                start = self.data['schedule']['start_date']
+                end = self.data['schedule']['end_date']
+                sched_info = f"Aktif ({start[:10]} → {end[:10]})"
+            
+            # Stats
+            stats = self.data.get('stats', {})
             
             status = f"""
-📊 **STATUS USERBOT**
+📊 **STATUS USERBOT LENGKAP**
 
-👤 **User:** {me.first_name}
-🆔 **ID:** `{me.id}`
-📱 **Username:** @{me.username or 'None'}
+**👤 User Info:**
+• Name: {me.first_name}
+• ID: `{me.id}`
+• Username: @{me.username or 'None'}
+• Phone: {self.phone}
 
-**⚙️ Pengaturan:**
+**📱 Session Info:**
+• Session: {self.session_name}
+• Created: {created_date.strftime('%Y-%m-%d')}
+• Active: {days_active} hari
+• Expire: {self.expire_date.strftime('%Y-%m-%d')}
+• Days left: {days_left} hari {'⚠️' if days_left < 3 else '✅'}
+
+**⚙️ Settings:**
 • Bot Status: {'✅ Aktif' if self.data['bot_active'] else '❌ Nonaktif'}
-• Grup Terpilih: {len(self.data.get('selected_groups', []))} grup
-• Pesan Tersimpan: {msg_info}
+• Selected Groups: {len(self.data.get('selected_groups', []))}/{len(self.data.get('groups', []))}
+• Saved Message: {msg_info}
 • Timer: {self.data.get('run_timer', 'Off')} {'menit' if self.data.get('run_timer') else ''}
-• Mode Tidur: {'✅ Aktif' if self.data.get('sleep_enabled', False) else '❌ Nonaktif'}
-• Auto Reply PM: {'✅ Aktif' if self.data.get('pm_enabled', False) else '❌ Nonaktif'}
-• Admin: {len(self.data.get('admins', []))} orang
+• Schedule: {sched_info}
+• Sleep Mode: {'✅ On' if self.data.get('sleep_enabled', False) else '❌ Off'}
+• Auto Reply: {'✅ On' if self.data.get('pm_enabled', False) else '❌ Off'}
+• Admins: {len(self.data.get('admins', []))}
 
-**⏰ Timer Settings:**
-• Spam Timer: {self.data.get('spam_timer', 5)} detik
-• Group Timer: {self.data.get('group_timer', 1)} detik
+**⏰ Timer Config:**
+• Spam Timer: {self.data.get('spam_timer', 5)}s
+• Group Timer: {self.data.get('group_timer', 1)}s
+• Notification: {'@' + self.data.get('notif_user', 'Off') if self.data.get('notif_user') else 'Off'}
 
-**📸 Media Support:**
-✅ Photo, Video, Document, Voice, Audio
-✅ Sticker, GIF, dengan/tanpa caption
-✅ Emoji premium & text formatting
+**📈 Statistics:**
+• Total Sent: {stats.get('total_sent', 0):,}
+• Total Failed: {stats.get('total_failed', 0):,}
+• Success Rate: {(stats.get('total_sent', 0) / (stats.get('total_sent', 0) + stats.get('total_failed', 1)) * 100):.1f}%
+• Last Run: {stats.get('last_run', 'Never')}
+
+**💾 Storage:**
+• Data Size: {os.path.getsize(self.data_file) / 1024:.1f} KB
+• Backups: {len(list(BACKUP_DIR.glob(f'{self.session_name}_*.json')))}
 """
             await event.reply(status)
         
@@ -622,42 +817,6 @@ class UserBot:
             
             await event.reply(sudo_list)
         
-        @self.client.on(events.NewMessage(pattern=r'^\.testformat$'))
-        async def test_format_handler(event):
-            if not await self.is_admin(event.sender_id):
-                return
-            
-            test_message = """
-🎨 **TEST FORMATTING & EMOJI**
-
-**Bold Text** | *Italic Text* | ***Bold Italic***
-`Monospace Code` | ~~Strikethrough~~ | __Underline__
-||Spoiler Text|| | [Link Text](https://telegram.org)
-
-**Emoji Test:**
-😀 😃 😄 😁 😆 😅 😂 🤣 ☺️ 😊 
-🔥 ⚡ ✨ 💫 💥 💢 💯 🎯 🎪 🎨
-
-**Unicode:**
-♠️ ♥️ ♦️ ♣️ ⚜️ 🔱 ⚡ ☄️ 🌟 ⭐
-
-**Combined:**
-***`Bold Italic Mono`*** | __*Underline Italic*__
-~~**Strikethrough Bold**~~ | ||***Spoiler Bold Italic***||
-
-✅ Jika semua format terlihat dengan benar, maka mode **NOFW** akan copy sempurna!
-
-📸 **Media Support:**
-• Photo + Caption ✅
-• Video + Caption ✅
-• Document ✅
-• Voice Note ✅
-• Audio File ✅
-• Sticker ✅
-• GIF ✅
-"""
-            await event.reply(test_message)
-        
         # Auto reply PM handler
         @self.client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
         async def pm_auto_reply(event):
@@ -683,6 +842,46 @@ class UserBot:
         else:
             return now >= start_time or now <= end_time
     
+    async def check_schedule(self):
+        """Check if current time is within schedule"""
+        while self.is_active:
+            try:
+                if self.data['schedule']['enabled']:
+                    now = datetime.now()
+                    start = datetime.fromisoformat(self.data['schedule']['start_date'])
+                    end = datetime.fromisoformat(self.data['schedule']['end_date'])
+                    
+                    # Check if schedule has ended
+                    if now > end:
+                        self.data['schedule']['enabled'] = False
+                        self.running = False
+                        if self.timer_task:
+                            self.timer_task.cancel()
+                        self.save_data()
+                        
+                        await self.send_admin_notif(
+                            "⏰ **JADWAL BERAKHIR**\n\n"
+                            f"Bot telah berhenti otomatis karena jadwal berakhir.\n"
+                            f"End time: {end.strftime('%Y-%m-%d %H:%M')}"
+                        )
+                    
+                    # Check if within schedule
+                    elif start <= now <= end:
+                        # Within schedule, allow running
+                        pass
+                    else:
+                        # Before schedule start
+                        if self.running:
+                            self.running = False
+                            if self.timer_task:
+                                self.timer_task.cancel()
+                
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Schedule check error: {e}")
+                await asyncio.sleep(60)
+    
     async def send_admin_notif(self, message):
         """Send notification to admin"""
         try:
@@ -692,17 +891,15 @@ class UserBot:
             pass
     
     async def send_message_to_group(self, group_id, message_data):
-        """Send message to a group with perfect copy including all media and formatting"""
+        """Send message to a group with perfect copy"""
         try:
             if message_data.get('forward'):
-                # Forward the original message
                 return await self.client.forward_messages(
                     group_id,
                     message_data['message_id'],
                     message_data['from_id']
                 )
             else:
-                # Get the original message for perfect copy
                 original_msg = await self.client.get_messages(
                     message_data.get('chat_id', message_data['from_id']),
                     ids=message_data['message_id']
@@ -711,8 +908,6 @@ class UserBot:
                 if not original_msg:
                     raise Exception("Original message not found")
                 
-                # Send with exact same formatting and media
-                # This handles ALL media types
                 return await self.client.send_message(
                     group_id,
                     message=original_msg.message,
@@ -730,6 +925,17 @@ class UserBot:
         """Main timer loop for sending messages"""
         while self.running and self.data.get('run_timer'):
             try:
+                # Check schedule
+                if self.data['schedule']['enabled']:
+                    now = datetime.now()
+                    start = datetime.fromisoformat(self.data['schedule']['start_date'])
+                    end = datetime.fromisoformat(self.data['schedule']['end_date'])
+                    
+                    if not (start <= now <= end):
+                        await asyncio.sleep(60)
+                        continue
+                
+                # Check sleep time
                 if await self.is_sleep_time():
                     await asyncio.sleep(60)
                     continue
@@ -752,7 +958,10 @@ class UserBot:
                     try:
                         await self.send_message_to_group(group['id'], self.data['message'])
                         success += 1
+                        
+                        # Always wait 1 second between groups
                         await asyncio.sleep(self.data.get('group_timer', 1))
+                        
                     except FloodWaitError as e:
                         logger.warning(f"Flood wait: {e.seconds} seconds")
                         await asyncio.sleep(e.seconds)
@@ -760,9 +969,15 @@ class UserBot:
                         failed += 1
                         logger.error(f"Failed to send to {group['title']}: {e}")
                 
+                # Update stats
+                self.data['stats']['total_sent'] += success
+                self.data['stats']['total_failed'] += failed
+                self.data['stats']['last_run'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.save_data()
+                
                 time_taken = (datetime.now() - start_time).seconds
                 
-                # Send notification if enabled
+                # Send detailed notification
                 if self.data.get('notif_user'):
                     try:
                         media_info = ""
@@ -772,16 +987,22 @@ class UserBot:
                         await self.client.send_message(
                             self.data['notif_user'],
                             f"📊 **LAPORAN PENGIRIMAN**\n\n"
+                            f"📱 Session: {self.session_name}\n"
+                            f"👤 Phone: {self.phone}\n\n"
                             f"✅ Berhasil: {success}/{len(self.data.get('selected_groups', []))}\n"
                             f"❌ Gagal: {failed}\n"
                             f"{media_info}"
                             f"⏱ Waktu: {time_taken} detik\n"
-                            f"⏰ Selesai: {datetime.now().strftime('%H:%M:%S')}"
+                            f"⏰ Selesai: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                            f"📈 **Total Stats:**\n"
+                            f"• Sent: {self.data['stats']['total_sent']:,}\n"
+                            f"• Failed: {self.data['stats']['total_failed']:,}\n"
+                            f"• Success Rate: {(self.data['stats']['total_sent'] / (self.data['stats']['total_sent'] + self.data['stats']['total_failed']) * 100):.1f}%"
                         )
                     except:
                         pass
                 
-                logger.info(f"Broadcast complete: {success} success, {failed} failed")
+                logger.info(f"[{self.session_name}] Broadcast complete: {success} success, {failed} failed")
                 
                 # Wait for next cycle
                 await asyncio.sleep(self.data['run_timer'] * 60)
@@ -790,18 +1011,307 @@ class UserBot:
                 logger.error(f"Timer loop error: {e}")
                 await asyncio.sleep(60)
 
+# ==================== MANAGER CLASS ====================
+class UserBotManager:
+    def __init__(self):
+        self.setup_directories()
+        self.load_manager_data()
+        self.bots: Dict[str, UserBot] = {}
+        
+    def setup_directories(self):
+        """Create necessary directories"""
+        for directory in [BASE_DIR, SESSIONS_DIR, DATA_DIR, BACKUP_DIR]:
+            directory.mkdir(parents=True, exist_ok=True)
+    
+    def load_manager_data(self):
+        """Load manager data"""
+        try:
+            if MANAGER_DATA.exists():
+                with open(MANAGER_DATA, 'r') as f:
+                    self.manager_data = json.load(f)
+            else:
+                self.manager_data = {
+                    'sessions': [],
+                    'created_at': datetime.now().isoformat()
+                }
+                self.save_manager_data()
+        except:
+            self.manager_data = {'sessions': []}
+    
+    def save_manager_data(self):
+        """Save manager data"""
+        with open(MANAGER_DATA, 'w') as f:
+            json.dump(self.manager_data, f, indent=2)
+    
+    async def create_session(self):
+        """Create new userbot session"""
+        print("\n" + "="*50)
+        print("📱 CREATE NEW USERBOT SESSION")
+        print("="*50)
+        
+        # Get duration
+        while True:
+            try:
+                days = int(input("\n📅 Berapa hari userbot aktif? (1-365): "))
+                if 1 <= days <= 365:
+                    break
+                print("❌ Masukkan angka antara 1-365!")
+            except:
+                print("❌ Masukkan angka yang valid!")
+        
+        expire_date = datetime.now() + timedelta(days=days)
+        
+        # Get phone number
+        phone = input("\n📱 Masukkan nomor telepon (dengan kode negara, contoh: +628xxx): ")
+        
+        # Create session name
+        session_name = f"bot_{phone.replace('+', '')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Create client
+        session_file = SESSIONS_DIR / f"{session_name}.session"
+        client = TelegramClient(str(session_file), API_ID, API_HASH)
+        
+        try:
+            await client.start(phone=phone)
+            
+            # Get user info
+            me = await client.get_me()
+            
+            print(f"\n✅ Login berhasil!")
+            print(f"👤 Nama: {me.first_name}")
+            print(f"🆔 ID: {me.id}")
+            print(f"📱 Username: @{me.username}")
+            
+            # Save session info
+            session_info = {
+                'session_name': session_name,
+                'phone': phone,
+                'user_id': me.id,
+                'username': me.username,
+                'first_name': me.first_name,
+                'created_at': datetime.now().isoformat(),
+                'expire_date': expire_date.isoformat(),
+                'active': True
+            }
+            
+            self.manager_data['sessions'].append(session_info)
+            self.save_manager_data()
+            
+            # Create userbot instance
+            bot = UserBot(phone, session_name, expire_date)
+            bot.client = client
+            
+            # Initialize bot data
+            bot.data['admins'] = [me.id]
+            bot.save_data()
+            
+            # Start bot
+            if await bot.start():
+                self.bots[session_name] = bot
+                print(f"\n✅ Userbot berhasil dibuat dan diaktifkan!")
+                print(f"📅 Expire: {expire_date.strftime('%Y-%m-%d')} ({days} hari)")
+            
+            await client.disconnect()
+            
+        except SessionPasswordNeededError:
+            password = input("🔐 Masukkan password 2FA: ")
+            await client.sign_in(password=password)
+            
+        except Exception as e:
+            print(f"\n❌ Error: {e}")
+            if session_file.exists():
+                session_file.unlink()
+    
+    async def delete_session(self):
+        """Delete userbot session"""
+        sessions = [s for s in self.manager_data['sessions'] if s['active']]
+        
+        if not sessions:
+            print("\n❌ Tidak ada userbot aktif!")
+            return
+        
+        print("\n" + "="*50)
+        print("🗑️ HAPUS USERBOT")
+        print("="*50)
+        
+        # List sessions
+        for i, session in enumerate(sessions):
+            expire = datetime.fromisoformat(session['expire_date'])
+            days_left = (expire - datetime.now()).days
+            
+            print(f"\n{i+1}. {session['first_name']} - {session['phone']}")
+            print(f"   Session: {session['session_name']}")
+            print(f"   Created: {session['created_at'][:10]}")
+            print(f"   Expire: {expire.strftime('%Y-%m-%d')} ({days_left} hari)")
+        
+        # Get choice
+        try:
+            choice = int(input("\n📌 Pilih nomor userbot yang akan dihapus (0 untuk batal): "))
+            if choice == 0:
+                return
+            
+            if 1 <= choice <= len(sessions):
+                session = sessions[choice - 1]
+                
+                confirm = input(f"\n⚠️ Yakin hapus {session['first_name']} - {session['phone']}? (y/n): ")
+                if confirm.lower() == 'y':
+                    # Create bot instance and stop it
+                    bot = UserBot(
+                        session['phone'],
+                        session['session_name'],
+                        datetime.fromisoformat(session['expire_date'])
+                    )
+                    
+                    print("\n🔄 Menghentikan userbot...")
+                    if await bot.start():
+                        await bot.stop()
+                    
+                    # Mark as inactive
+                    for s in self.manager_data['sessions']:
+                        if s['session_name'] == session['session_name']:
+                            s['active'] = False
+                            break
+                    
+                    self.save_manager_data()
+                    
+                    # Remove data file
+                    data_file = DATA_DIR / f"{session['session_name']}_data.json"
+                    if data_file.exists():
+                        data_file.unlink()
+                    
+                    print("✅ Userbot berhasil dihapus!")
+            else:
+                print("❌ Pilihan tidak valid!")
+                
+        except:
+            print("❌ Input tidak valid!")
+    
+    def list_sessions(self):
+        """List all userbot sessions"""
+        sessions = [s for s in self.manager_data['sessions'] if s['active']]
+        
+        print("\n" + "="*50)
+        print("📋 DAFTAR USERBOT")
+        print("="*50)
+        
+        if not sessions:
+            print("\n❌ Tidak ada userbot aktif!")
+            return
+        
+        for i, session in enumerate(sessions):
+            expire = datetime.fromisoformat(session['expire_date'])
+            created = datetime.fromisoformat(session['created_at'])
+            days_left = (expire - datetime.now()).days
+            days_active = (datetime.now() - created).days
+            
+            status = "✅ Active" if days_left > 0 else "❌ Expired"
+            
+            print(f"\n{i+1}. {session['first_name']} (@{session['username']})")
+            print(f"   📱 Phone: {session['phone']}")
+            print(f"   🆔 User ID: {session['user_id']}")
+            print(f"   📁 Session: {session['session_name']}")
+            print(f"   📅 Created: {created.strftime('%Y-%m-%d %H:%M')}")
+            print(f"   ⏰ Expire: {expire.strftime('%Y-%m-%d')} ({days_left} hari)")
+            print(f"   📊 Active: {days_active} hari")
+            print(f"   🔸 Status: {status}")
+        
+        print(f"\n📊 Total: {len(sessions)} userbot aktif")
+    
+    async def run_all_bots(self):
+        """Run all active bots"""
+        sessions = [s for s in self.manager_data['sessions'] if s['active']]
+        
+        if not sessions:
+            print("\n❌ Tidak ada userbot untuk dijalankan!")
+            return
+        
+        print(f"\n🚀 Menjalankan {len(sessions)} userbot...")
+        
+        tasks = []
+        for session in sessions:
+            expire = datetime.fromisoformat(session['expire_date'])
+            
+            # Skip expired sessions
+            if datetime.now() > expire:
+                print(f"⏩ Skip {session['first_name']} - Expired")
+                continue
+            
+            bot = UserBot(session['phone'], session['session_name'], expire)
+            self.bots[session['session_name']] = bot
+            
+            # Start bot
+            task = asyncio.create_task(bot.start())
+            tasks.append(task)
+        
+        # Wait for all bots to start
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        active_count = sum(1 for r in results if r is True)
+        print(f"\n✅ {active_count} userbot berhasil dijalankan!")
+        
+        # Keep running
+        try:
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            print("\n\n🛑 Menghentikan semua bot...")
+            
+            # Stop all bots
+            stop_tasks = []
+            for bot in self.bots.values():
+                if bot.is_active:
+                    stop_tasks.append(bot.stop())
+            
+            await asyncio.gather(*stop_tasks, return_exceptions=True)
+            print("✅ Semua bot dihentikan!")
+    
+    async def main_menu(self):
+        """Main menu interface"""
+        while True:
+            print("\n" + "="*50)
+            print("🤖 TELEGRAM MULTI USERBOT MANAGER")
+            print("📌 Version: 3.0 ULTIMATE")
+            print("="*50)
+            print("\n1. 📱 Create Userbot Baru")
+            print("2. 🗑️  Hapus Userbot") 
+            print("3. 📋 List Userbot")
+            print("4. 🚀 Jalankan Semua Userbot")
+            print("5. ❌ Exit")
+            
+            try:
+                choice = int(input("\n📌 Pilih menu (1-5): "))
+                
+                if choice == 1:
+                    await self.create_session()
+                elif choice == 2:
+                    await self.delete_session()
+                elif choice == 3:
+                    self.list_sessions()
+                elif choice == 4:
+                    await self.run_all_bots()
+                elif choice == 5:
+                    print("\n👋 Goodbye!")
+                    break
+                else:
+                    print("❌ Pilihan tidak valid!")
+                    
+            except KeyboardInterrupt:
+                print("\n\n👋 Goodbye!")
+                break
+            except:
+                print("❌ Input tidak valid!")
+
 # ==================== MAIN FUNCTION ====================
 async def main():
     """Main function"""
-    bot = UserBot()
-    await bot.start()
+    manager = UserBotManager()
+    await manager.main_menu()
 
 # ==================== RUN SCRIPT ====================
 if __name__ == '__main__':
     print("\n" + "="*50)
-    print("🚀 TELEGRAM USERBOT JASEBKING")
-    print("📌 Version: 2.0 FULL FEATURED")
-    print("📸 Support: All Media + Emoji Premium")
+    print("🚀 TELEGRAM MULTI USERBOT MANAGER")
+    print("📌 Version: 3.0 ULTIMATE")
+    print("📌 Features: Multi bot, schedule, auto expire")
     print("="*50 + "\n")
     
     # Check API credentials
@@ -813,21 +1323,16 @@ if __name__ == '__main__':
         print("3. Klik 'API Development Tools'")
         print("4. Create New Application")
         print("5. Copy API_ID dan API_HASH")
-        print("6. Ganti di line 24-25 file ini")
+        print("6. Ganti di line 17-18 file ini")
         print("\n" + "="*50)
-        exit(1)
+        sys.exit(1)
     
-    # Run bot
+    # Run manager
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Bot dihentikan oleh user!")
+        print("\n\n👋 Manager dihentikan!")
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        print("\n💡 Kemungkinan solusi:")
-        print("1. Cek koneksi internet")
-        print("2. Pastikan API_ID dan API_HASH benar")
-        print("3. Hapus file userbot.session dan coba lagi")
-        print("4. Install telethon: pip install telethon")
 
 # ==================== END OF SCRIPT ====================
